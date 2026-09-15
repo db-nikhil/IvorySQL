@@ -34,7 +34,9 @@
 #include "parser/parse_coerce.h"
 #include "parser/parse_target.h"
 #include "parser/parse_expr.h"
+#include "parser/parse_func.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/makefuncs.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "utils/builtins.h"
@@ -3165,6 +3167,216 @@ is_subprocfunc_argnum(PLiSQL_function * pfunc, int dno)
 
 
 /*
+ * Look up a known, fixed builtin function by name using the same catalog
+ * resolution machinery (polymorphism, variadic packing, coercion) that an
+ * ordinary catalog function call goes through, so the collection-method
+ * redirects below don't have to reimplement any of that.
+ */
+static FuncDetailCode
+lookup_builtin_coll_func(const char *funcname, List *fargs, Oid *argtypes, int nargs,
+						 Oid *funcid, Oid *rettype, bool *retset,
+						 int *nvargs, Oid *vatype, Oid **true_typeids,
+						 List **argdefaults)
+{
+	int			fgc_flags;
+
+	/*
+	 * Schema-qualified to pg_catalog: these are compiler-generated calls to
+	 * internal collection helpers taking the internal collection type, and
+	 * must never resolve through search_path to something a user happens to
+	 * have defined.
+	 */
+	return func_get_detail(list_make2(makeString("pg_catalog"),
+									  makeString(pstrdup(funcname))),
+						   fargs, NIL, nargs, argtypes,
+						   true, true, false,
+						   &fgc_flags,
+						   funcid, rettype, retset,
+						   nvargs, vatype, true_typeids, argdefaults);
+}
+
+
+
+/*
+ * Try to redirect a call-shaped Oracle collection reference -- coll(i),
+ * coll.EXISTS(i), or the bare collection type name used as a constructor
+ * (type_name(...)) -- to a small builtin helper function that implements
+ * it on the backing array value.
+ *
+ * Returns true (with the FuncDetailCode-style outputs filled in) if
+ * funcname/fargs matched one of these forms; false otherwise, in which
+ * case the caller falls through to its ordinary subproc/package/catalog
+ * lookup unchanged.
+ *
+ * None of these forms take named arguments -- a subscript or a constructor
+ * element has no parameter name to name -- so a non-NIL fargnames bails out
+ * immediately, false.  Without this check, *fargs could still contain the
+ * NamedArgExpr wrapper node ParseFuncOrColumn built before calling in here
+ * (it only extracts the names into fargnames; it leaves the wrapper nodes in
+ * fargs), and that wrapper would be redirected into a helper whose signature
+ * knows nothing about it instead of being rejected with a clear error.
+ *
+ * Deliberately does NOT set *pfunc: the resulting funcid is a genuine
+ * pg_proc OID (unlike a real nested-subproc call, whose funcid is a local
+ * index into the compiling function's own subproc table), and leaving
+ * *pfunc NULL is exactly what makes ParseFuncOrColumn tag the resulting
+ * FuncExpr FUNC_FROM_PG_PROC instead of FUNC_FROM_SUBPROCFUNC.
+ */
+static bool
+try_resolve_collection_call(ParseState *pstate, List *funcname,
+							List **fargs, List *fargnames,
+							int nargs, Oid *argtypes,
+							bool proc_call,
+							Oid *funcid, Oid *rettype, bool *retset,
+							int *nvargs, Oid *vatype, Oid **true_typeids,
+							List **argdefaults, FuncDetailCode *result)
+{
+	PLiSQL_expr *expr = (PLiSQL_expr *) pstate->p_ref_hook_state;
+	int			list_len = list_length(funcname);
+	char	   *name1;
+	char	   *name2 = NULL;
+	PLiSQL_nsitem *nse;
+	int			nnames;
+	PLiSQL_execstate *estate;
+
+	if (proc_call)
+		return false;			/* none of these forms are procedures */
+
+	if (fargnames != NIL)
+		return false;			/* no form here takes a named argument */
+
+	if (list_len == 1)
+		name1 = strVal(linitial(funcname));
+	else if (list_len == 2)
+	{
+		name1 = strVal(linitial(funcname));
+		name2 = strVal(lsecond(funcname));
+	}
+	else
+		return false;
+
+	nse = plisql_ns_lookup(expr->ns, false, name1, NULL, NULL, &nnames);
+	if (nse == NULL)
+		return false;
+
+	estate = expr->func->cur_estate;
+
+	if (nse->itemtype == PLISQL_NSTYPE_VAR)
+	{
+		PLiSQL_var *var = (PLiSQL_var *) estate->datums[nse->itemno];
+		Node	   *coll_param;
+		List	   *newargs;
+		Oid			newargtypes[3];
+		int			nnewargs;
+		const char *helper;
+
+		if (var->datatype == NULL || var->datatype->tbltype == NULL)
+			return false;		/* not a declared collection variable */
+
+		if (nargs != 1)
+			return false;		/* neither form takes any other arity */
+
+		if (name2 == NULL)
+			helper = "plisql_coll_get_internal";
+		else if (pg_strcasecmp(name2, "EXISTS") == 0)
+			helper = "plisql_coll_exists_internal";
+		else if (pg_strcasecmp(name2, "NEXT") == 0)
+			helper = "plisql_coll_next_internal";
+		else if (pg_strcasecmp(name2, "PRIOR") == 0)
+			helper = "plisql_coll_prior_internal";
+		else
+			return false;
+
+		coll_param = make_datum_param(expr, nse->itemno,
+									  exprLocation((Node *) linitial(*fargs)),
+									  PLISQL_PARAM_COLLECTION_VALUE);
+		newargs = list_make2(coll_param, linitial(*fargs));
+		newargtypes[0] = PLISQL_COLLECTIONOID;
+		newargtypes[1] = argtypes[0];
+		nnewargs = 2;
+
+		/*
+		 * coll(i) must return the ELEMENT type, but with the collection
+		 * typed plisql_collection there is no polymorphic argument to infer
+		 * it from.  Anchor it with a typed NULL of the declared element
+		 * type -- the same device the zero-argument constructor below uses,
+		 * and for the same reason.
+		 */
+		if (name2 == NULL)
+		{
+			Const	   *anchor;
+
+			anchor = makeNullConst(var->datatype->tbltype->elemtypoid,
+								   var->datatype->tbltype->elemtypmod,
+								   var->datatype->tbltype->elemcollation);
+			newargs = lappend(newargs, anchor);
+			newargtypes[2] = var->datatype->tbltype->elemtypoid;
+			nnewargs = 3;
+		}
+
+		*result = lookup_builtin_coll_func(helper, newargs, newargtypes,
+										   nnewargs,
+										   funcid, rettype, retset,
+										   nvargs, vatype, true_typeids,
+										   argdefaults);
+		if (*result == FUNCDETAIL_NOTFOUND)
+			return false;
+		*fargs = newargs;
+		return true;
+	}
+	else if (nse->itemtype == PLISQL_NSTYPE_TBLTYPE && name2 == NULL)
+	{
+		PLiSQL_tbl_type *tbltype = (PLiSQL_tbl_type *) estate->datums[nse->itemno];
+
+		if (tbltype->tbl_kind == PLISQL_TBL_VARRAY &&
+			nargs > tbltype->varray_limit)
+			ereport(ERROR,
+					(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+					 errmsg("VARRAY limit exceeded: declared %d, constructor called with %d",
+							tbltype->varray_limit, nargs)));
+
+		if (nargs == 0)
+		{
+			/*
+			 * Postgres cannot resolve a purely-variadic ANYELEMENT
+			 * parameter (plisql_coll_construct's signature) from zero
+			 * actual arguments -- there's nothing to infer the element
+			 * type from. Redirect the empty constructor, e.g.
+			 * "v tab_t := tab_t();", to a dedicated non-variadic helper
+			 * anchored by a typed NULL built from the element type this
+			 * compile-time TBLTYPE lookup already knows.
+			 */
+			Node	   *nullarg = (Node *) makeNullConst(tbltype->elemtypoid,
+														 tbltype->elemtypmod,
+														 tbltype->elemcollation);
+			List	   *emptyargs = list_make1(nullarg);
+			Oid			emptyargtype = tbltype->elemtypoid;
+
+			*result = lookup_builtin_coll_func("plisql_coll_construct_empty",
+											   emptyargs, &emptyargtype, 1,
+											   funcid, rettype, retset,
+											   nvargs, vatype, true_typeids,
+											   argdefaults);
+			if (*result == FUNCDETAIL_NOTFOUND)
+				return false;
+			*fargs = emptyargs;
+			return true;
+		}
+
+		*result = lookup_builtin_coll_func("plisql_coll_construct", *fargs,
+										   argtypes, nargs,
+										   funcid, rettype, retset,
+										   nvargs, vatype, true_typeids,
+										   argdefaults);
+		if (*result == FUNCDETAIL_NOTFOUND)
+			return false;
+		return true;
+	}
+
+	return false;
+}
+
+/*
  * Similar to plisql_param_ref: resolve a subproc function reference.
  * Argument handling aligns with func_get_detail.
  */
@@ -3194,6 +3406,18 @@ plisql_subprocfunc_ref(ParseState *pstate, List *funcname,
 	char	   *name3 = NULL;
 	int			list_len = list_length(funcname);
 	FuncDetailCode detail;
+
+	{
+		FuncDetailCode coll_result;
+
+		if (try_resolve_collection_call(pstate, funcname, fargs, fargnames,
+										nargs, argtypes,
+										proc_call,
+										funcid, rettype, retset,
+										nvargs, vatype, true_typeids, argdefaults,
+										&coll_result))
+			return coll_result;
+	}
 
 	switch (list_len)
 	{

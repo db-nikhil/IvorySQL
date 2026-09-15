@@ -49,6 +49,8 @@ OBJS = \
 	pl_subproc_function.o \
 	pl_package.o \
 	pl_exception_type.o \
+	pl_collection.o \
+	pl_collection_runtime.o \
 	$(top_builddir)/src/backend/oracle_parser/ora_scan.o
 
 DATA = plisql.control plisql--1.0.sql

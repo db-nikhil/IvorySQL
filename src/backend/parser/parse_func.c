@@ -140,6 +140,7 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 	char		function_from = FUNC_FROM_PG_PROC;
 	void	   *pfunc = NULL;
 	Oid			pkgoid = InvalidOid;
+	bool		subprocfunc_hook_redirected_to_pg_proc = false;
 
 
 	/*
@@ -329,13 +330,30 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 			/*
 			 * Distinguish WITH-clause inline functions from PL/iSQL nested
 			 * subprograms.  The WITH-clause hook (withFuncLookupHook) always
-			 * leaves pfunc == NULL; the PL/iSQL subproc hook always sets it
-			 * to a non-NULL PLiSQL_function pointer.
+			 * leaves pfunc == NULL; the PL/iSQL subproc hook sets it to a
+			 * non-NULL PLiSQL_function pointer when it resolved to a genuine
+			 * nested subprogram (whose funcid is a local index into that
+			 * function's subproc table, not a pg_proc OID), but leaves it
+			 * NULL when it instead redirected the call to an ordinary
+			 * catalog function (e.g. Oracle collection-method syntactic
+			 * sugar) -- such a funcid must be tagged FUNC_FROM_PG_PROC so
+			 * every consumer of FuncExpr->function_from treats it as the
+			 * real pg_proc entry it is, not a subproc-table index.
 			 */
 			if (pstate->p_subprocfunc_hook == withFuncLookupHook)
 				function_from = FUNC_FROM_WITH_CLAUSE;
-			else
+			else if (pfunc != NULL)
 				function_from = FUNC_FROM_SUBPROCFUNC;
+			else
+			{
+				function_from = FUNC_FROM_PG_PROC;
+				/* see the fargs-rebuild comment below: this redirect may
+				 * have replaced fargs with a differently-shaped list (e.g.
+				 * prepending an implicit argument) that actual_arg_types,
+				 * still describing the pre-redirect call, no longer
+				 * matches. */
+				subprocfunc_hook_redirected_to_pg_proc = true;
+			}
 		}
 		else if (list_length(funcname) == 1)
 		{
@@ -440,9 +458,17 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 	 * For subprocedures, the fix in pl_subproc_function.c also rebuilds
 	 * true_typeids (declared_arg_types) in declared order after reordering,
 	 * so that both arrays match the reordered fargs.
+	 *
+	 * The same rebuild is needed when the subprocfunc hook redirected the
+	 * call to an ordinary pg_proc function with a different fargs shape
+	 * (see subprocfunc_hook_redirected_to_pg_proc above) -- that path
+	 * already returns declared_arg_types/true_typeids describing the new
+	 * signature, but actual_arg_types/nargs here still describe the
+	 * pre-redirect call unless rebuilt too.
 	 */
 	if ((function_from == FUNC_FROM_PACKAGE ||
-		 function_from == FUNC_FROM_SUBPROCFUNC) &&
+		 function_from == FUNC_FROM_SUBPROCFUNC ||
+		 subprocfunc_hook_redirected_to_pg_proc) &&
 		fdresult != FUNCDETAIL_NOTFOUND)
 	{
 		ListCell   *lc;
